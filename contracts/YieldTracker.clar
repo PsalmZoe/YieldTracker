@@ -45,11 +45,11 @@
     (var-get yield-rate)
 )
 
-(define-read-only (calculate-pending-yield (user principal))
+(define-read-only (calculate-pending-yield (user principal) (current-block uint))
     (match (map-get? user-deposits user)
         deposit-info
         (let (
-            (blocks-elapsed (- block-height (get last-claim-block deposit-info)))
+            (blocks-elapsed (- current-block (get last-claim-block deposit-info)))
             (deposit-amount (get amount deposit-info))
             (annual-blocks u52560) ;; Approximate blocks per year
             (yield-amount (/ (* (* deposit-amount (var-get yield-rate)) blocks-elapsed) (* annual-blocks u10000)))
@@ -59,8 +59,26 @@
     )
 )
 
+;; Helper function for internal yield calculation - FIXED: Added current-block parameter
+(define-private (calculate-yield-internal (user principal) (current-block uint))
+    (match (map-get? user-deposits user)
+        deposit-info
+        (let (
+            (blocks-elapsed (- current-block (get last-claim-block deposit-info)))
+            (deposit-amount (get amount deposit-info))
+            (annual-blocks u52560) ;; Approximate blocks per year
+            (yield-amount (/ (* (* deposit-amount (var-get yield-rate)) blocks-elapsed) (* annual-blocks u10000)))
+        )
+        yield-amount)
+        u0
+    )
+)
+
 ;; Public functions
 (define-public (deposit-stx (amount uint))
+    (let (
+        (current-block stacks-block-height)
+    )
     (begin
         (asserts! (>= amount minimum-deposit-amount) err-minimum-deposit)
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
@@ -70,34 +88,35 @@
             ;; Update existing deposit
             (let (
                 (new-amount (+ (get amount existing-deposit) amount))
-                (pending-yield-result (unwrap-panic (calculate-pending-yield tx-sender)))
+                (pending-yield (calculate-yield-internal tx-sender current-block))
             )
             (map-set user-deposits tx-sender {
                 amount: new-amount,
                 deposit-block: (get deposit-block existing-deposit),
-                last-claim-block: block-height
+                last-claim-block: current-block
             })
             (map-set user-yield-earned tx-sender 
-                (+ (get-user-yield tx-sender) pending-yield-result))
+                (+ (get-user-yield tx-sender) pending-yield))
             )
             ;; Create new deposit
             (map-set user-deposits tx-sender {
                 amount: amount,
-                deposit-block: block-height,
-                last-claim-block: block-height
+                deposit-block: current-block,
+                last-claim-block: current-block
             })
         )
         
         (var-set total-deposits (+ (var-get total-deposits) amount))
         (ok amount)
-    )
+    ))
 )
 
 (define-public (withdraw-stx (amount uint))
     (let (
+        (current-block stacks-block-height)
         (user-deposit (unwrap! (map-get? user-deposits tx-sender) err-no-position))
         (deposit-amount (get amount user-deposit))
-        (pending-yield-result (unwrap-panic (calculate-pending-yield tx-sender)))
+        (pending-yield (calculate-yield-internal tx-sender current-block))
     )
     (asserts! (> amount u0) err-invalid-amount)
     (asserts! (<= amount deposit-amount) err-insufficient-balance)
@@ -110,28 +129,29 @@
         (map-set user-deposits tx-sender {
             amount: (- deposit-amount amount),
             deposit-block: (get deposit-block user-deposit),
-            last-claim-block: block-height
+            last-claim-block: current-block
         })
     )
     
     ;; Update yield earned
     (map-set user-yield-earned tx-sender 
-        (+ (get-user-yield tx-sender) pending-yield-result))
+        (+ (get-user-yield tx-sender) pending-yield))
     
     ;; Update total deposits
     (var-set total-deposits (- (var-get total-deposits) amount))
     
-    ;; Transfer STX back to user
-    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    ;; Transfer STX back to user - FIXED: Correct transfer direction
+    (try! (as-contract (stx-transfer? amount (as-contract tx-sender) tx-sender)))
     (ok amount)
     )
 )
 
 (define-public (claim-yield)
     (let (
+        (current-block stacks-block-height)
         (user-deposit (unwrap! (map-get? user-deposits tx-sender) err-no-position))
-        (pending-yield-result (unwrap-panic (calculate-pending-yield tx-sender)))
-        (total-yield (+ (get-user-yield tx-sender) pending-yield-result))
+        (pending-yield (calculate-yield-internal tx-sender current-block))
+        (total-yield (+ (get-user-yield tx-sender) pending-yield))
     )
     (asserts! (> total-yield u0) err-invalid-amount)
     
@@ -139,14 +159,14 @@
     (map-set user-deposits tx-sender {
         amount: (get amount user-deposit),
         deposit-block: (get deposit-block user-deposit),
-        last-claim-block: block-height
+        last-claim-block: current-block
     })
     
     ;; Reset yield earned
     (map-delete user-yield-earned tx-sender)
     
-    ;; Transfer yield to user (in a real implementation, this would come from protocol earnings)
-    (try! (as-contract (stx-transfer? total-yield tx-sender tx-sender)))
+    ;; Transfer yield to user - FIXED: Correct transfer direction
+    (try! (as-contract (stx-transfer? total-yield (as-contract tx-sender) tx-sender)))
     (ok total-yield)
     )
 )
